@@ -124,15 +124,17 @@ jobs:
     - name: Compile OpenWrt (R76S 架构锁定)
       working-directory: /builder
       id: compile
-      continue-on-error: true # 保持原有的容错设置
+      # 保持原有的 continue-on-error: true 设置
+      continue-on-error: true
       env:
+        # 保持 secrets 变量，防止 build.sh 脚本中残留的代码报错
         git_name: ${{ secrets.username }}
         git_password: ${{ secrets.password }}
       run: |
-        # 1. 确保 openwrt 目录存在（build.sh 的 make defconfig 需要它）
+        # 1. 确保 openwrt 目录存在
         mkdir -p openwrt
         
-        # 2. 定义源文件路径 (使用你本地的正确文件名)
+        # 2. 定义源文件路径 (使用你本地的正确文件名: 24-config-musl-r76s)
         CONFIG_SRC="$GITHUB_WORKSPACE/r4s_build_script/openwrt/24-config-musl-r76s"
         CONFIG_DEST="openwrt/.config"
         
@@ -141,7 +143,7 @@ jobs:
         if [ -f "$CONFIG_SRC" ]; then
           cp "$CONFIG_SRC" "$CONFIG_DEST"
         else
-          echo "❌ 严重错误: 配置文件 $CONFIG_SRC 不存在！请检查文件名和路径。"
+          echo "❌ 严重错误: 配置文件 $CONFIG_SRC 不存在！请检查 GitHub 文件名和路径。"
           exit 1
         fi
         
@@ -153,23 +155,27 @@ jobs:
         # 5. 验证架构是否锁定成功 (安全检查)
         if ! grep -q "CONFIG_TARGET_rockchip=y" .config; then
             echo "❌ 架构锁定失败！.config 文件未包含 Rockchip 配置。"
+            # 输出 MIPS 配置信息，用于最终诊断
+            grep 'CONFIG_TARGET_' .config
             exit 1
         fi
         cd ..
         
         # 6. 运行 build.sh 脚本进行环境配置和编译
-        # 此时 build.sh 发现 .config 已存在，会跳过自身的配置选择逻辑，直接开始编译。
+        # 移除所有 Build options 中易错的高级优化参数，只保留 BUILD_FAST=y
         export BUILD_FAST=y
         export LAN=${{ github.event.inputs.lan_addr }}
         
-        # 传递原始的 build_options，但 BUILD_FAST 会覆盖掉易错的 LTO/MOLD
-        export ${{ github.event.inputs.build_options }} USE_GCC15=y
+        # 保持 USE_GCC15=y（build.sh 默认会用 GCC14）
+        export USE_GCC15=y
+        
         [ ${{ github.event.inputs.ccache }} = 'true' ] && export ENABLE_CCACHE=y
         [ -n ${{ github.event.inputs.root_password }} ] && export ROOT_PASSWORD="${{ github.event.inputs.root_password }}"
 
+        # 运行 build.sh
         bash <(curl -sS http://127.0.0.1:8080/build.sh) ${{ env.build_version }} ${{ github.event.inputs.device }}
         
-        # 7. 原始的 tags 逻辑
+        # 7. 原始的 tags 逻辑 (保持不变)
         cd openwrt
         if [ "${{ github.event.inputs.version }}" = release ]; then
           tags=OpenWrt-$(git describe --abbrev=0 --tags)
@@ -177,7 +183,6 @@ jobs:
           tags=snapshot-24.10-$(git log -n 1 --date=format:"%Y%m%d" --format="%cd")-$(git log --pretty=format:"%h" -1)
         fi
         echo "latest_release=$tags" >>$GITHUB_ENV
-
     - name: Extensive logs after a failed compilation
       working-directory: /builder
       if: steps.compile.outcome == 'failure'

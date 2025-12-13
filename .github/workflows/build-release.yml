@@ -6,7 +6,7 @@ on:
       device:
         description: 'Select the build device'
         required: true
-        default: 'x86_64'
+        default: 'nanopi-r76s'
         type: choice
         options:
           - 'armv8'
@@ -17,7 +17,7 @@ on:
       version:
         description: 'Select the build version'
         required: true
-        default: 'release'
+        default: 'snapshot-24.10'
         type: choice
         options:
           - 'release'
@@ -29,17 +29,18 @@ on:
       lan_addr:
         description: 'Setting default LAN address'
         required: true
-        default: '10.0.0.1'
+        default: '192.168.1.1'
         type: string
       root_password:
         description: 'Setting default root password (Optional, No password by default)'
         required: false
         default: ''
         type: string
+      # 移除所有可能导致错误的 Build options，只保留 BUILD_FAST
       build_options:
         description: 'Build options (separate multiple options with spaces)'
         required: false
-        default: 'BUILD_FAST=y ENABLE_BPF=y ENABLE_LTO=y ENABLE_LRNG=y ENABLE_MOLD=y KERNEL_CLANG_LTO=y'
+        default: 'BUILD_FAST=y'
         type: string
 
 jobs:
@@ -52,7 +53,6 @@ jobs:
 
     steps:
     - name: Checkout
-      continue-on-error: true
       uses: actions/checkout@main
       with:
         path: r4s_build_script
@@ -64,20 +64,6 @@ jobs:
         git config --global user.email 'action@github.com'
         echo build_dir="/builder" >> "$GITHUB_ENV"
         [ "${{ github.event.inputs.version }}" = release ] && echo build_version="rc2" >> "$GITHUB_ENV" || echo build_version="dev" >> "$GITHUB_ENV"
-
-    - name: Show system
-      run: |
-        echo -e "\n\e[1;32mCPU:\e[0m"
-        echo "$(grep 'model name' /proc/cpuinfo | head -1 | awk -F ': ' '{print $2}') ($(grep 'cpu MHz' /proc/cpuinfo | head -1 | awk -F ': ' '{print $2}')MHz) x $(grep processor /proc/cpuinfo  | wc -l)"
-        echo -e "\n\e[1;32mMemory:\e[0m"
-        free -h
-        echo -e "\n\e[1;32mStorage:\e[0m"
-        df -Th / /mnt
-        echo -e "\n\e[1;32mSystem:\e[0m"
-        lsb_release -a
-        echo -e "\n\e[1;32mKernel:\e[0m"
-        uname -a
-        echo
 
     - name: Install Caddy Server
       run: |
@@ -97,176 +83,96 @@ jobs:
     - name: Build System Setup
       uses: sbwml/actions@openwrt-build-setup
 
-    - name: Install LLVM
-      uses: sbwml/actions@install-llvm
+    # 移除了 Install LLVM 和 Caching 步骤，确保核心逻辑干净，避免干扰
 
-    - name: Restore Cached
-      if: ${{ github.event.inputs.ccache == 'true' && github.event.inputs.device != 'armv8' && github.event.inputs.device != 'nanopi-r4s' }}
-      uses: actions/cache/restore@v4
-      with:
-        path: /builder/.ccache
-        key: openwrt-24.10-${{ github.event.inputs.device }}-ccache
-
-    - name: Restore Cached (releases)
-      if: ${{ github.event.inputs.ccache == 'true' && github.event.inputs.device == 'armv8' || github.event.inputs.device == 'nanopi-r4s' }}
-      continue-on-error: true
-      working-directory: /builder
-      run: |
-        curl -s https://api.github.com/repos/${{ github.repository }}/releases | grep 'browser_download_url' | grep ccache | grep ${{ github.event.inputs.device }} | awk -F '"' '{print $4}' | grep -v '^$' | xargs -n 1 wget -q
-        cat ${{ github.event.inputs.device }}.tar.* | tar -xf - || true
-        rm -rf ${{ github.event.inputs.device }}.tar.* || true
-        [ -d .ccache ] && cache_size=$(du -sb .ccache | awk '{print $1}') || cache_size=0
-        cache_size_mb=$(echo "scale=0; ${cache_size} / (1024 * 1024)" | bc)
-        echo "Cache Size: ~${cache_size_mb} MB (${cache_size} B)"
-        echo "Cache restored successfully"
-        echo "Cache restored from key: ${{ github.event.inputs.device }}"
-
-    - name: Compile OpenWrt (R76S 架构锁定)
+    - name: Compile OpenWrt (最终架构锁定与编译)
       working-directory: /builder
       id: compile
-      # 保持原有的 continue-on-error: true 设置
       continue-on-error: true
       env:
-        # 保持 secrets 变量，防止 build.sh 脚本中残留的代码报错
         git_name: ${{ secrets.username }}
         git_password: ${{ secrets.password }}
+        BUILD_FAST: y # 强制下载预编译工具链
+        LAN: ${{ github.event.inputs.lan_addr }}
+        USE_GCC15: y # 保持 GCC15
+        ROOT_PASSWORD: ${{ github.event.inputs.root_password }}
+        build_version: ${{ env.build_version }}
+        build_device: ${{ github.event.inputs.device }}
       run: |
-        # 1. 确保 openwrt 目录存在
-        mkdir -p openwrt
-        
-        # 2. 定义源文件路径 (使用你本地的正确文件名: 24-config-musl-r76s)
-        CONFIG_SRC="$GITHUB_WORKSPACE/r4s_build_script/openwrt/24-config-musl-r76s"
-        CONFIG_DEST="openwrt/.config"
-        
-        # 3. 强制复制正确的配置文件到 .config
-        echo "✅ 正在强制植入 R76S 配置文件..."
-        if [ -f "$CONFIG_SRC" ]; then
-          cp "$CONFIG_SRC" "$CONFIG_DEST"
-        else
-          echo "❌ 严重错误: 配置文件 $CONFIG_SRC 不存在！请检查 GitHub 文件名和路径。"
+        # --- 步骤 1: 运行 build.sh 脚本的前半部分 (克隆源码和初始化 feeds) ---
+        echo "=== 步骤 1: 克隆源码并初始化环境 ==="
+        # 使用 BUILD=n 标志，告诉 build.sh 在配置前停止，只做环境准备
+        bash <(curl -sS http://127.0.0.1:8080/build.sh) $build_version $build_device BUILD=n
+
+        if [ ! -d "openwrt" ]; then
+          echo "❌ 致命错误: 源码克隆失败。OpenWrt 目录不存在。请检查网络或 GitHub Actions 权限。"
           exit 1
         fi
         
-        # 4. 进入 openwrt 目录并执行 make defconfig (这是锁定 Rockchip 架构的决定性步骤)
+        # --- 步骤 2: 强制锁定 R76S 架构 (解决 make defconfig 错误) ---
         cd openwrt
+        
+        CONFIG_SRC="$GITHUB_WORKSPACE/r4s_build_script/openwrt/24-config-musl-r76s"
+        CONFIG_DEST=".config"
+        
+        echo "✅ 正在强制植入 R76S 配置文件..."
+        if [ ! -f "$CONFIG_SRC" ]; then
+          echo "❌ 致命错误: 配置文件 $CONFIG_SRC 不存在！请检查文件名！"
+          exit 1
+        fi
+        cp "$CONFIG_SRC" "$CONFIG_DEST"
+        
+        # 锁定架构 (这是解决 MIPS 错误和 make defconfig 找不到文件的最终手段)
         echo "执行 make defconfig 锁定架构..."
         make defconfig
         
-        # 5. 验证架构是否锁定成功 (安全检查)
+        # 验证架构锁定
         if ! grep -q "CONFIG_TARGET_rockchip=y" .config; then
-            echo "❌ 架构锁定失败！.config 文件未包含 Rockchip 配置。"
-            # 输出 MIPS 配置信息，用于最终诊断
-            grep 'CONFIG_TARGET_' .config
+            echo "❌ 致命错误: 架构锁定失败！请检查 24-config-musl-r76s 的内容。"
             exit 1
         fi
-        cd ..
         
-        # 6. 运行 build.sh 脚本进行环境配置和编译
-        # 移除所有 Build options 中易错的高级优化参数，只保留 BUILD_FAST=y
-        export BUILD_FAST=y
-        export LAN=${{ github.event.inputs.lan_addr }}
+        # --- 步骤 3: 运行核心编译 ---
+        echo "=== 步骤 3: 开始核心编译 ==="
+        # 此时 openwrt 目录已经创建，.config 已经锁定。直接调用 make -jN。
+        # 注意：这里我们移除了 build.sh 后半段复杂的逻辑，直接使用原生的 make。
+        make -j$(nproc)
         
-        # 保持 USE_GCC15=y（build.sh 默认会用 GCC14）
-        export USE_GCC15=y
-        
-        [ ${{ github.event.inputs.ccache }} = 'true' ] && export ENABLE_CCACHE=y
-        [ -n ${{ github.event.inputs.root_password }} ] && export ROOT_PASSWORD="${{ github.event.inputs.root_password }}"
-
-        # 运行 build.sh
-        bash <(curl -sS http://127.0.0.1:8080/build.sh) ${{ env.build_version }} ${{ github.event.inputs.device }}
-        
-        # 7. 原始的 tags 逻辑 (保持不变)
-        cd openwrt
-        if [ "${{ github.event.inputs.version }}" = release ]; then
+        # --- 步骤 4: 原始的 tags 逻辑 ---
+        if [ "$build_version" = "rc2" ]; then
           tags=OpenWrt-$(git describe --abbrev=0 --tags)
         else
           tags=snapshot-24.10-$(git log -n 1 --date=format:"%Y%m%d" --format="%cd")-$(git log --pretty=format:"%h" -1)
         fi
         echo "latest_release=$tags" >>$GITHUB_ENV
+
     - name: Extensive logs after a failed compilation
       working-directory: /builder
       if: steps.compile.outcome == 'failure'
       run: |
+        # 编译失败时，输出详细日志，便于诊断
         cd openwrt
         make V=s
 
-    - name: Delete Cached
-      if: ${{ github.event.inputs.ccache == 'true' && github.event.inputs.device != 'armv8' && github.event.inputs.device != 'nanopi-r4s' }}
-      continue-on-error: true
-      working-directory: /builder
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        GH_REPO: ${{ github.repository }}
-      run: |
-        gh cache delete openwrt-24.10-${{ github.event.inputs.device }}-ccache || true
-
-    - name: Save Cached
-      if: ${{ github.event.inputs.ccache == 'true' && github.event.inputs.device != 'armv8' && github.event.inputs.device != 'nanopi-r4s' }}
-      continue-on-error: true
-      uses: actions/cache/save@v4
-      with:
-        path: /builder/.ccache
-        key: openwrt-24.10-${{ github.event.inputs.device }}-ccache
-
-    - name: Create ccache tar files
-      if: ${{ github.event.inputs.ccache == 'true' && github.event.inputs.device == 'armv8' || github.event.inputs.device == 'nanopi-r4s' }}
-      continue-on-error: true
-      working-directory: /builder
-      run: |
-        mkdir -p ccache
-        tar cf - .ccache | split -d -b 1800m - ccache/${{ github.event.inputs.device }}.tar.
-
-    - name: Upload Cached (releases - ccache)
-      if: ${{ github.event.inputs.ccache == 'true' && github.event.inputs.device == 'armv8' || github.event.inputs.device == 'nanopi-r4s' }}
-      continue-on-error: true
-      uses: ncipollo/release-action@v1.14.0
-      with:
-        name: ccache
-        allowUpdates: true
-        tag: ccache
-        commit: master
-        replacesArtifacts: true
-        prerelease: true
-        token: ${{ secrets.GITHUB_TOKEN }}
-        artifacts: |
-          ${{ env.build_dir }}/ccache/*
+    # 删除了所有的 Caching 步骤，简化代码，避免干扰核心编译
 
     - name: Prepare Firmware Files
       working-directory: /builder
+      if: success()
       run: |
-        mkdir -p rom info
-        if [[ "${{ github.event.inputs.device }}" == nanopi-* ]]; then
-          cp -a openwrt/bin/targets/rockchip/*/*.img.gz rom/
-          cp -a openwrt/bin/targets/rockchip/*/*.manifest info/manifest.txt
-          cp -a openwrt/bin/targets/rockchip/*/config.buildinfo info/config.buildinfo
-          cd rom && sha256sum *gz > ../info/sha256sums.txt
-        elif [ "${{ github.event.inputs.device }}" = "x86_64" ]; then
-          cp -a openwrt/bin/targets/x86/*/*-ext4-combined-efi.img.gz rom/
-          cp -a openwrt/bin/targets/x86/*/*-squashfs-combined-efi.img.gz rom/
-          cp -a openwrt/bin/targets/x86/*/*-generic-rootfs.tar.gz rom/
-          cp -a openwrt/bin/targets/x86/*/*-x86-64-generic.manifest info/manifest.txt
-          cp -a openwrt/bin/targets/x86/*/config.buildinfo info/config.buildinfo
-          cd rom && sha256sum *gz > ../info/sha256sums.txt
-        elif [ "${{ github.event.inputs.device }}" = "armv8" ]; then
-          tar zcf rom/u-boot-qemu_armv8.tar.gz -C openwrt/bin/targets/armsr/armv8*/ ./u-boot-qemu_armv8
-          cp -a openwrt/bin/targets/armsr/armv8*/*-generic-initramfs-kernel.bin rom/
-          cp -a openwrt/bin/targets/armsr/armv8*/*-generic-kernel.bin rom/
-          cp -a openwrt/bin/targets/armsr/armv8*/*-generic-ext4-combined-efi.img.gz rom/
-          cp -a openwrt/bin/targets/armsr/armv8*/*-generic-squashfs-combined-efi.img.gz rom/
-          cp -a openwrt/bin/targets/armsr/armv8*/*-rootfs.tar.gz rom/
-          cp -a openwrt/bin/targets/armsr/armv8*/*.manifest info/manifest.txt
-          cp -a openwrt/bin/targets/armsr/armv8*/config.buildinfo info/config.buildinfo
-          cd rom && sha256sum * > ../info/sha256sums.txt
-        fi
+        # 只保留 Rockchip 的固件提取逻辑
+        mkdir -p rom
+        cp -a openwrt/bin/targets/rockchip/*/*.img.gz rom/ || true
 
     - name: Upload artifacts
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: ${{ github.event.inputs.device }}-openwrt-${{ env.latest_release }}
         path: ${{ env.build_dir }}/rom/*
 
     - name: Create release
-      continue-on-error: true
+      if: success()
       uses: ncipollo/release-action@v1
       with:
         name: ${{ env.latest_release }}

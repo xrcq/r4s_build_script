@@ -121,18 +121,55 @@ jobs:
         echo "Cache restored successfully"
         echo "Cache restored from key: ${{ github.event.inputs.device }}"
 
-    - name: Compile OpenWrt
+    - name: Compile OpenWrt (R76S 架构锁定)
       working-directory: /builder
       id: compile
-      continue-on-error: true
+      continue-on-error: true # 保持原有的容错设置
       env:
         git_name: ${{ secrets.username }}
         git_password: ${{ secrets.password }}
       run: |
-        export ${{ github.event.inputs.build_options }} LAN=${{ github.event.inputs.lan_addr }} USE_GCC15=y
+        # 1. 确保 openwrt 目录存在（build.sh 的 make defconfig 需要它）
+        mkdir -p openwrt
+        
+        # 2. 定义源文件路径 (使用你本地的正确文件名)
+        CONFIG_SRC="$GITHUB_WORKSPACE/r4s_build_script/openwrt/24-config-musl-r76s"
+        CONFIG_DEST="openwrt/.config"
+        
+        # 3. 强制复制正确的配置文件到 .config
+        echo "✅ 正在强制植入 R76S 配置文件..."
+        if [ -f "$CONFIG_SRC" ]; then
+          cp "$CONFIG_SRC" "$CONFIG_DEST"
+        else
+          echo "❌ 严重错误: 配置文件 $CONFIG_SRC 不存在！请检查文件名和路径。"
+          exit 1
+        fi
+        
+        # 4. 进入 openwrt 目录并执行 make defconfig (这是锁定 Rockchip 架构的决定性步骤)
+        cd openwrt
+        echo "执行 make defconfig 锁定架构..."
+        make defconfig
+        
+        # 5. 验证架构是否锁定成功 (安全检查)
+        if ! grep -q "CONFIG_TARGET_rockchip=y" .config; then
+            echo "❌ 架构锁定失败！.config 文件未包含 Rockchip 配置。"
+            exit 1
+        fi
+        cd ..
+        
+        # 6. 运行 build.sh 脚本进行环境配置和编译
+        # 此时 build.sh 发现 .config 已存在，会跳过自身的配置选择逻辑，直接开始编译。
+        export BUILD_FAST=y
+        export LAN=${{ github.event.inputs.lan_addr }}
+        
+        # 传递原始的 build_options，但 BUILD_FAST 会覆盖掉易错的 LTO/MOLD
+        export ${{ github.event.inputs.build_options }} USE_GCC15=y
         [ ${{ github.event.inputs.ccache }} = 'true' ] && export ENABLE_CCACHE=y
         [ -n ${{ github.event.inputs.root_password }} ] && export ROOT_PASSWORD="${{ github.event.inputs.root_password }}"
+
         bash <(curl -sS http://127.0.0.1:8080/build.sh) ${{ env.build_version }} ${{ github.event.inputs.device }}
+        
+        # 7. 原始的 tags 逻辑
         cd openwrt
         if [ "${{ github.event.inputs.version }}" = release ]; then
           tags=OpenWrt-$(git describe --abbrev=0 --tags)
